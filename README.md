@@ -67,6 +67,71 @@ docs/         架构、协议表、部署、HA 接入、逆向过程
 - Home Assistant：需要先装上游 [jarylc/hass-pet-marvel](https://github.com/jarylc/hass-pet-marvel)
 - 设备：PetMarvel C1（productKey `a14KPydEhd3`），固件 1.0.2 验证通过
 
+## 让 AI agent 帮你部署
+
+把下面这段直接发给你常用的 coding agent（Claude Code / Codex / Cursor 等），它会先读仓库再动手：
+
+````text
+我在用 PetMarvel C1 猫砂盆，想按 https://github.com/KiriKira/petmarvel-c1-local 这个方案
+把它完全本地化：设备不出外网，路由器当它的服务器，Home Assistant 直接接入。
+
+请在我这台机器上帮我完成部署：
+
+1. 先完整读仓库里的 README、docs/architecture.md、docs/router-setup.md、docs/ha-integration.md，
+   确认你理解了 DNS 劫持 / DNAT / 假 HTTPS 这三层接管各自解决什么问题。
+
+2. 动手前先问我这几件事，不要自己猜：
+   - 路由器型号、SSH 地址、是否有可写的持久分区（小米路由器是 /data）
+   - 路由器架构（`uname -m` 的结果，决定 GOARCH）
+   - 猫砂盆在 DHCP 租约里的 IP，或者它的 MAC 前缀
+   - Home Assistant 的安装方式（HAOS / 容器 / Supervised），custom_components 具体路径
+
+3. 编译必须用 Go 1.23.x。Go 1.24 起移除了 RSA 密钥交换，编出来的 broker 和设备握手会直接失败。
+   本机没有 1.23 就先装一个，不要用新版凑合。
+
+4. 这些坑已经踩过，部署时直接按这个来：
+   - 路由器 dropbear 一般没有 sftp-server，scp 会失败，用 `cat file | ssh 'cat > dest'`
+   - 老款小米路由器只提供 ssh-rsa 主机密钥，需要 `-o HostKeyAlgorithms=+ssh-rsa`
+   - DNAT 到 127.0.0.1 必须开 `route_localnet=1`，否则包会被当 martian 丢掉
+   - 443 不能只 REJECT，必须交给 broker 的假 HTTPS，否则设备卡在开机状态反复重试
+   - 进程要用 `start-stop-daemon -b` 并重定向 `>/dev/null 2>&1 </dev/null`，
+     否则会跟着 SSH 会话一起死
+
+5. 每完成一步都给我验证证据，不要只说"配置好了"：
+   - `conntrack -L | grep <设备IP>` 看设备实际在连谁
+   - `tail /tmp/petbroker.log` 看有没有 `[device] CONNECT`
+   - HA 里实体有没有值、点一次 Clean 设备有没有反应
+
+6. 我的设备 ID、MAC、内网地址由我提供。不要把它们写进任何会被提交、会被公开的文件。
+
+如果某一步和仓库文档不一致，以设备的实际回执为准，并把差异告诉我。
+````
+
+英文版（给非中文 agent / 更省 token 的场景）：
+
+````text
+Deploy https://github.com/KiriKira/petmarvel-c1-local for my PetMarvel C1 litter box:
+the device must not reach the vendor cloud, my router serves it locally, and Home Assistant
+talks to the local broker.
+
+Read README.md and docs/{architecture,router-setup,ha-integration}.md first.
+
+Before touching anything, ask me for: router model + SSH address + writable persistent partition,
+router arch (`uname -m`), the litter box IP or its MAC prefix, and how Home Assistant is installed
+(plus the custom_components path).
+
+Rules:
+- Build with Go 1.23.x only. Go 1.24 removed RSA key exchange; newer builds fail the handshake.
+- dropbear has no sftp-server: transfer with `cat f | ssh 'cat > dst'`.
+- Old Xiaomi routers need `-o HostKeyAlgorithms=+ssh-rsa`.
+- Set `route_localnet=1` before DNAT-ing to 127.0.0.1.
+- Do not merely REJECT 443 — hand it to the broker's fake HTTPS or the device hangs at boot.
+- Start the daemon with `start-stop-daemon -b ... >/dev/null 2>&1 </dev/null`.
+
+After each step, show evidence (conntrack, broker log lines, HA entity values) instead of claiming success.
+Never write my device ID, MAC or LAN addresses into files that get committed or published.
+````
+
 ## 免责
 
 - 仅用于**自己拥有**的设备，做的就是把自家设备指向自家服务器。
