@@ -1,0 +1,22 @@
+# 二进制产物
+petbroker
+petbroker_amd64
+petbroker_arm64
+petbroker_arm64.xz
+*.xz
+
+# 证书与私钥（绝对不要提交）
+*.key
+*.pem
+*.crt
+!docs/**/*.crt
+
+# 抓包与日志（包含真实设备数据）
+*.pcap
+*.pcapng
+*.jsonl
+*.log
+
+# Python
+__pycache__/
+*.pyc

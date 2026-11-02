@@ -1,0 +1,149 @@
+--- a/custom_components/pet_marvel/sensor.py
++++ b/custom_components/pet_marvel/sensor.py
+@@ -12,7 +12,7 @@
+ from homeassistant.const import (
+     UnitOfMass,
+ )
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ from .const import DOMAIN, MANUFACTURER
+ from .coordinator import PetMarvelCoordinator
+@@ -65,6 +65,18 @@
+             ],
+             icon="mdi:state-machine",
+         ),
++        PetMarvelActivitySensor(
++            coordinator,
++            device_info,
++            translation="activity",
++            icon="mdi:history",
++        ),
++        PetMarvelRecordCountSensor(
++            coordinator,
++            device_info,
++            translation="record_count",
++            icon="mdi:database-clock",
++        ),
+         PetMarvelMapSensor(
+             coordinator,
+             device_info,
+@@ -105,6 +117,107 @@
+     async_add_entities(sensors)
+ 
+ 
++class PetMarvelActivitySensor(CoordinatorEntity):
++    """Latest C1 activity plus recent work/toileting records."""
++
++    _attr_should_poll = False
++    _attr_has_entity_name = True
++
++    def __init__(self, coordinator, deviceinfo, translation: str, icon: str = None):
++        super().__init__(coordinator)
++        self.device_info = deviceinfo
++        self.translation_key = translation
++        self._attr_unique_id = f"{coordinator.deviceid}-{translation}"
++        if icon is not None:
++            self._attr_icon = icon
++
++    @callback
++    def _handle_coordinator_update(self) -> None:
++        self.async_write_ha_state()
++
++    @staticmethod
++    def _iso_timestamp(timestamp: int):
++        if not timestamp:
++            return None
++        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
++
++    @property
++    def state(self):
++        activity = self.coordinator.data.activity
++        return activity["event_name"] if activity else "unknown"
++
++    @property
++    def extra_state_attributes(self):
++        data = self.coordinator.data
++        activity = data.activity or {}
++        records = []
++        for record in data.records[:100]:
++            item = dict(record)
++            item["event_time"] = self._iso_timestamp(item["event_time"])
++            records.append(item)
++        return {
++            "latest_event_time": self._iso_timestamp(activity.get("event_time", 0)),
++            "latest_event_type": activity.get("event_type"),
++            "latest_weight_grams": activity.get("weight_grams"),
++            "latest_duration_seconds": activity.get("duration_seconds"),
++            "today_total": data.record_overview.get("today_total", 0),
++            "today_toileting": data.record_overview.get("today_toileting", 0),
++            "today_work_record": data.record_overview.get("today_work_record", 0),
++            "record_window_days": data.record_overview.get("window_days", 7),
++            "stored_record_count": data.record_overview.get("stored_record_count", len(data.records)),
++            "oldest_record_time": self._iso_timestamp(
++                data.record_overview.get("oldest_record_time", 0)
++            ),
++            "records_source": data.record_overview.get(
++                "records_source", "local_store_with_cloud_backfill"
++            ),
++            "record_sync_error": data.record_overview.get("sync_error"),
++            "records": records,
++        }
++
++
++class PetMarvelRecordCountSensor(CoordinatorEntity):
++    """Number of records persisted locally for this device."""
++
++    _attr_should_poll = False
++    _attr_has_entity_name = True
++    _attr_state_class = SensorStateClass.MEASUREMENT
++
++    def __init__(self, coordinator, deviceinfo, translation: str, icon: str = None):
++        super().__init__(coordinator)
++        self.device_info = deviceinfo
++        self.translation_key = translation
++        self._attr_unique_id = f"{coordinator.deviceid}-{translation}"
++        if icon is not None:
++            self._attr_icon = icon
++
++    @callback
++    def _handle_coordinator_update(self) -> None:
++        self.async_write_ha_state()
++
++    @property
++    def state(self):
++        return len(self.coordinator.data.records)
++
++    @property
++    def extra_state_attributes(self):
++        overview = self.coordinator.data.record_overview
++        return {
++            "oldest_record_time": PetMarvelActivitySensor._iso_timestamp(
++                overview.get("oldest_record_time", 0)
++            ),
++            "latest_record_time": PetMarvelActivitySensor._iso_timestamp(
++                self.coordinator.data.records[0]["event_time"]
++                if self.coordinator.data.records
++                else 0
++            ),
++            "today_total": overview.get("today_total", 0),
++            "today_toileting": overview.get("today_toileting", 0),
++            "today_work_record": overview.get("today_work_record", 0),
++            "source": overview.get("records_source", "local_store_with_cloud_backfill"),
++        }
++
++
+ class PetMarvelCatSensor(CoordinatorEntity):
+     _attr_should_poll = False
+     _attr_has_entity_name = True
+@@ -274,5 +387,8 @@
+ 
+     @property
+     def state(self):
+-        timestamp = getattr(self.coordinator.data, self.data_key) / 1000
+-        return datetime.fromtimestamp(timestamp)
++        raw = getattr(self.coordinator.data, self.data_key, 0) or 0
++        if not raw:
++            # 还没有使用记录时返回 unknown，而不是 1970-01-01
++            return None
++        return datetime.fromtimestamp(raw / 1000)

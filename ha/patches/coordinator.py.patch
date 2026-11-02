@@ -1,0 +1,411 @@
+--- a/custom_components/pet_marvel/coordinator.py
++++ b/custom_components/pet_marvel/coordinator.py
+@@ -1,6 +1,7 @@
+ import logging
+ from dataclasses import dataclass
+-from datetime import timedelta
++from datetime import datetime, timedelta, timezone
++from zoneinfo import ZoneInfo
+ from typing import Any
+ 
+ from homeassistant.config_entries import ConfigEntry
+@@ -16,14 +17,18 @@
+ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+ 
+ from .api import PetMarvelAPI, APIAuthError, APIConnectionError
+-from .const import DOMAIN
++from .const import DOMAIN, RECORD_EVENT_NAMES
+ from .value_cacher import ValueCacher
++from .local_alcs import C1Client, Config as LocalConfig
++from .mqtt_client import C1MQTTClient
++from .record_store import C1RecordStore, normalize_record
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+ _SERVICE_MAPPING = {
+-    "clean": 0,
+-    "level": 1,
++    # C1 H5 contract: 0=reset/level, 1=clean, 2=dump.
++    "clean": 1,
++    "level": 0,
+     "dump": 2,
+ }
+ 
+@@ -45,8 +50,9 @@
+     LightSwitch: bool
+ 
+     software_version: str
+-    # cat_list: list[object] = field(default_factory=list)
+-    # record_list: list[object] = field(default_factory=list)
++    activity: dict[str, Any] | None
++    records: list[dict[str, Any]]
++    record_overview: dict[str, Any]
+ 
+ 
+ class PetMarvelCoordinator(DataUpdateCoordinator):
+@@ -63,12 +69,60 @@
+         self.country = config_entry.data[CONF_COUNTRY]
+         self.email = config_entry.data[CONF_EMAIL]
+         self.password = config_entry.data[CONF_PASSWORD]
++        self.hass = hass
++        self._config_entry = config_entry
++        # 运行期开关：集成选项优先，其次看 entry 里记录的 transport
++        self.options = dict(config_entry.options)
++        use_local = self.options.get("use_local_broker")
++        if use_local is True:
++            self.transport = "mqtt"
++        elif use_local is False:
++            self.transport = "cloud"
++        else:
++            self.transport = config_entry.data.get("transport", "cloud")
++        mqtt_host = (
++            self.options.get("mqtt_host")
++            or config_entry.data.get("mqtt_host")
++            or "192.168.31.1"
++        )
++        mqtt_port = int(
++            self.options.get("mqtt_port")
++            or config_entry.data.get("mqtt_port")
++            or 1884
++        )
++        self._local_client = None
++        self._mqtt_client = None
++        # broker 侧用 deviceName 做 topic，实体 unique_id 仍用原 deviceid，避免实体重建
++        self.device_key = (
++            self.options.get("device_key")
++            or config_entry.data.get("device_key")
++            or (config_entry.data.get(CONF_FRIENDLY_NAME) if self.transport == "mqtt" else "")
++            or ""
++        )
++        if self.transport == "local":
++            self._local_client = C1Client(LocalConfig(
++                host=config_entry.data["local_host"],
++                product_key=config_entry.data["local_product_key"],
++                device_name=config_entry.data["local_device_name"],
++                access_key=config_entry.data["local_access_key"],
++                access_token=config_entry.data["local_access_token"],
++                port=int(config_entry.data.get("local_port", 5683)),
++            ))
++        elif self.transport == "mqtt":
++            self._mqtt_client = C1MQTTClient(
++                host=mqtt_host,
++                port=mqtt_port,
++                device_id=self.device_key,
++            )
++            self._mqtt_client.connect()
+ 
+         self._device_name = None
+         self.last_usage = None
+ 
++        self._record_store = C1RecordStore(hass, self.deviceid)
++
+         self._recordsCache = ValueCacher(
+-            refresh_after=timedelta(minutes=30), discard_after=timedelta(hours=4)
++            refresh_after=timedelta(seconds=30), discard_after=timedelta(minutes=10)
+         )
+         self._devicePropertiesCache = ValueCacher(
+             refresh_after=timedelta(seconds=0), discard_after=timedelta(minutes=30)
+@@ -89,15 +143,63 @@
+         session = async_get_clientsession(hass)
+         self.api = PetMarvelAPI(session, hass.async_add_executor_job)
+ 
++    @property
++    def connected(self) -> bool:
++        """Return whether the selected transport is initialized."""
++        if self._mqtt_client is not None:
++            return self._mqtt_client.connected or bool(self._mqtt_client.get_state())
++        return self._local_client is not None or self.api.connected
++
++    async def async_wait_connected(self, timeout: float = 15.0) -> None:
++        """等待 MQTT 连接并拿到第一份状态（broker 会立即推 retain）。"""
++        if self._mqtt_client is None:
++            return
++        import asyncio
++        import time as _time
++
++        deadline = _time.monotonic() + timeout
++        while _time.monotonic() < deadline:
++            if self._mqtt_client.connected and self._mqtt_client.get_state():
++                return
++            await asyncio.sleep(0.2)
++        _LOGGER.warning("petmarvel: 等待本地 broker 状态超时（%.0fs）", timeout)
++
+     async def set_property(self, key: str, value: Any):
+-        await self.api.connect(self.country, self.email, self.password)
+-        await self.api.set_device_properties(self.deviceid, {key: value})
++        if self._mqtt_client is not None:
++            await self.hass.async_add_executor_job(self._set_property_mqtt, key, value)
++        elif self._local_client is not None:
++            await self.hass.async_add_executor_job(
++                self._local_client.set_properties, {key: value}
++            )
++        else:
++            await self.api.connect(self.country, self.email, self.password)
++            await self.api.set_device_properties(self.deviceid, {key: value})
+         # update data
+         setattr(self.data, key, value)
+         self.async_set_updated_data(self.data)
+ 
++    def _set_property_mqtt(self, key: str, value: Any) -> None:
++        """把 HA 的属性写入翻译成 broker 命令。"""
++        if key == "DeviceControl":
++            cmd = {0: "level", 1: "clean", 2: "dump"}.get(int(value))
++            if cmd:
++                self._mqtt_client.send_command(cmd)
++            return
++        mapping = {
++            "AutoClean": "auto_clean",
++            "DeepClean": "deep_clean",
++            "SmallCatMode": "small_cat_mode",
++            "LightSwitch": "light",
++        }
++        cmd = mapping.get(key)
++        if cmd:
++            self._mqtt_client.send_command(cmd, 1 if value else 0)
++        else:
++            _LOGGER.warning("petmarvel mqtt: 未支持的属性 %s", key)
++
+     async def invoke_service(self, service: str):
+-        await self.api.connect(self.country, self.email, self.password)
++        if self._local_client is None and self._mqtt_client is None:
++            await self.api.connect(self.country, self.email, self.password)
+         if service not in _SERVICE_MAPPING:
+             raise Exception("cannot find service to invoke")
+         await self.set_property("DeviceControl", _SERVICE_MAPPING[service])
+@@ -116,39 +218,203 @@
+         self._device_name = device_name
+         return device_name
+ 
+-    # async def _get_records(self):
+-    #     async def fetch():
+-    #         await self.api.connect(self.country, self.username, self.password)
+-    #         deviceName = await self._getDeviceName()
+-    #         return await self.api.getRecords(deviceName)
+-    #
+-    #     return await self._recordsCache.get_or_update(fetch)
++    async def _get_records(self) -> dict[str, Any]:
++        """Load local records and incrementally backfill them from the cloud."""
++        async def fetch():
++            await self._record_store.async_load()
++            end = int(datetime.now(timezone.utc).timestamp())
++            start = await self._record_store.async_get_sync_start(end)
++            if self._local_client is not None:
++                local_records = await self._record_store.async_get_records()
++                return {
++                    "overview": {},
++                    "detail": local_records,
++                    "stored_count": len(local_records),
++                    "sync_start": start,
++                }
++            await self.api.connect(self.country, self.email, self.password)
++            remote = await self.api.get_c1_log(self.deviceid, start, end)
++            remote_records = remote.get("detail", []) if isinstance(remote, dict) else []
++            merged = await self._record_store.async_merge(
++                [record for record in remote_records if isinstance(record, dict)]
++            )
++            return {
++                "overview": remote.get("overview", {}) if isinstance(remote, dict) else {},
++                "detail": merged,
++                "stored_count": len(merged),
++                "sync_start": start,
++            }
++
++        return await self._recordsCache.get_or_update(fetch)
++
++    @staticmethod
++    def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
++        """Compatibility wrapper for existing coordinator callers."""
++        return normalize_record(record)
++
++    def _records_summary(
++        self, records: list[dict[str, Any]], fallback_overview: dict[str, Any]
++    ) -> dict[str, Any]:
++        try:
++            zone = ZoneInfo(self.hass.config.time_zone)
++        except Exception:
++            zone = timezone.utc
++        today = datetime.now(zone).date()
++        today_records = [
++            record
++            for record in records
++            if record["event_time"]
++            and datetime.fromtimestamp(record["event_time"], timezone.utc)
++            .astimezone(zone)
++            .date()
++            == today
++        ]
++        toileting = [record for record in today_records if record["event_type"] == 1]
++        work = [record for record in today_records if record["event_type"] != 1]
++        summary = dict(fallback_overview or {})
++        summary.update(
++            {
++                "window_days": 7,
++                "today_total": len(today_records),
++                "today_toileting": len(toileting),
++                "today_work_record": len(work),
++                "stored_record_count": len(records),
++                "oldest_record_time": min(
++                    (record["event_time"] for record in records if record["event_time"]),
++                    default=0,
++                ),
++                "records_source": "local_store_with_cloud_backfill",
++            }
++        )
++        return summary
+ 
+     async def _get_device_properties(self):
+         async def fetch():
++            if self._mqtt_client is not None:
++                return await self.hass.async_add_executor_job(
++                    self._mqtt_client.get_state
++                )
++            if self._local_client is not None:
++                return await self.hass.async_add_executor_job(
++                    self._local_client.get_properties
++                )
+             await self.api.connect(self.country, self.email, self.password)
+             return await self.api.get_device_properties(self.deviceid)
+ 
+         return await self._devicePropertiesCache.get_or_update(fetch)
+ 
++    async def _data_from_mqtt(self, st: dict) -> PetMarvelAPIData:
++        """把 broker 的 state JSON 映射成原有数据结构，并把新记录并入本地 store。"""
++        last_usage = 0
++        raw_usage = st.get("last_usage")
++        if raw_usage:
++            try:
++                # 设备格式: "2026-11-02 18:14:32 1"（末尾是该日第几次）
++                stamp = raw_usage.rsplit(" ", 1)[0]
++                dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(
++                    tzinfo=ZoneInfo("Asia/Shanghai")
++                )
++                last_usage = int(dt.timestamp() * 1000)
++            except Exception:
++                _LOGGER.debug("petmarvel mqtt: last_usage 解析失败 %r", raw_usage)
++
++        # 新的如厕记录只在拿到设备时间时落库，避免用 HA 本地时间反复写入重复记录
++        new_records: list[dict[str, Any]] = []
++        cat_use = st.get("cat_use") or {}
++        if cat_use.get("weight_g") and last_usage:
++            new_records.append(
++                {
++                    "event_time": last_usage // 1000,
++                    "event_type": 1,
++                    "weight": cat_use.get("weight_g"),
++                    "duration": cat_use.get("duration_s"),
++                }
++            )
++        stored = await (
++            self._record_store.async_merge(new_records)
++            if new_records
++            else self._record_store.async_get_records()
++        )
++        records = sorted(
++            (self._normalize_record(record) for record in stored),
++            key=lambda record: record["event_time"],
++            reverse=True,
++        )
++        toilet_times = [r["event_time"] for r in records if r["event_type"] == 1]
++        if toilet_times:
++            last_usage = max(toilet_times) * 1000
++        activity = records[0] if records else None
++        overview = self._records_summary(records, {})
++        overview["records_source"] = "local_broker"
++
++        return PetMarvelAPIData(
++            work_status=int(st.get("work_status", 0) or 0),
++            up_lid_status=bool(st.get("lid_installed", True)),
++            drawer_status=bool(st.get("bin_inserted", True)),
++            full_status=bool(st.get("bin_full", False)),
++            last_usage=last_usage,
++            error_status=int(st.get("error_code", 0) or 0),
++            AutoClean=st.get("auto_clean", 0) == 1,
++            DeepClean=st.get("deep_clean", 0) == 1,
++            SmallCatMode=st.get("small_cat_mode", 0) == 1,
++            LightSwitch=st.get("light", 0) == 1,
++            software_version=str(st.get("fw_version", "")),
++            activity=activity,
++            records=records,
++            record_overview=overview,
++        )
++
+     async def async_update_data(self):
+         """Fetch data from API endpoint.
+ 
+         This is the place to pre-process the data to lookup tables
+         so entities can quickly look up their data.
+         """
++        if self._mqtt_client is not None:
++            state = await self.hass.async_add_executor_job(self._mqtt_client.get_state)
++            if not state:
++                raise UpdateFailed("本地 broker 尚未收到设备状态")
++            return await self._data_from_mqtt(state)
+         try:
+             devicedata = await self._get_device_properties()
+ 
+-            last_usage = devicedata["ExcreteTimes"]["time"]
++            property_last_usage = devicedata["ExcreteTimes"]["time"]
++            try:
++                record_payload = await self._get_records()
++            except Exception as err:
++                # Records are supplementary; keep status available if this endpoint is down.
++                _LOGGER.warning("Unable to fetch C1 work records: %s", err)
++                try:
++                    local_records = await self._record_store.async_get_records()
++                except Exception:
++                    local_records = []
++                record_payload = {
++                    "overview": {},
++                    "detail": local_records,
++                    "stored_count": len(local_records),
++                    "sync_error": type(err).__name__,
++                }
++            raw_records = record_payload.get("detail", [])
++            records = [
++                self._normalize_record(record)
++                for record in raw_records
++                if isinstance(record, dict)
++            ]
++            records.sort(key=lambda record: record["event_time"], reverse=True)
++            toilet_times = [
++                record["event_time"] for record in records if record["event_type"] == 1
++            ]
++            last_usage = (max(toilet_times) * 1000) if toilet_times else property_last_usage
++            activity = records[0] if records else None
++            record_overview = self._records_summary(
++                records, record_payload.get("overview", {})
++            )
+ 
+             if self.last_usage != last_usage:
+                 self._recordsCache.mark_as_stale()
+ 
+             self.last_usage = last_usage
+ 
+-            # records = await self._getRecords()
+-
+             try:
+                 return PetMarvelAPIData(
+                     work_status=devicedata["workstatus"]["value"],
+@@ -162,6 +428,9 @@
+                     SmallCatMode=devicedata["SmallCatMode"]["value"] == 1,
+                     LightSwitch=devicedata["LightSwitch"]["value"] == 1,
+                     software_version=devicedata["SoftwareVersion"]["value"],
++                    activity=activity,
++                    records=records,
++                    record_overview=record_overview,
+                 )
+             except Exception as err:
+                 _LOGGER.error(err)
+@@ -175,3 +444,12 @@
+         except APIConnectionError as err:
+             _LOGGER.error(err)
+             raise UpdateFailed(err) from err
++
++    async def async_close(self) -> None:
++        """Close the local UDP socket / MQTT link, if a local transport is selected."""
++        if self._mqtt_client is not None:
++            await self.hass.async_add_executor_job(self._mqtt_client.close)
++            self._mqtt_client = None
++        if self._local_client is not None:
++            await self.hass.async_add_executor_job(self._local_client.close)
++            self._local_client = None

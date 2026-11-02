@@ -1,0 +1,98 @@
+--- a/custom_components/pet_marvel/translations/en.json
++++ b/custom_components/pet_marvel/translations/en.json
+@@ -3,7 +3,14 @@
+     "config": {
+         "step": {
+             "user": {
+-                "title": "Pet Marvel Setup",
++                "title": "Pet Marvel",
++                "description": "Choose how Home Assistant talks to the litter box.",
++                "data": {
++                    "use_local_broker": "Use self-hosted broker (local)"
++                }
++            },
++            "cloud": {
++                "title": "Pet Marvel cloud login",
+                 "description": "Enter your Pet Marvel credentials.",
+                 "data": {
+                     "country": "Country",
+@@ -11,17 +18,41 @@
+                     "password": "Password"
+                 }
+             },
++            "local": {
++                "title": "Local broker",
++                "description": "Point at the broker on your router. Leave Device ID empty to list devices automatically.",
++                "data": {
++                    "mqtt_host": "Broker host",
++                    "mqtt_port": "Broker port",
++                    "device_id": "Device ID (optional)",
++                    "friendly_name": "Name (optional)"
++                }
++            },
+             "device": {
+                 "description": "Select one of the available device IDs.",
+                 "data": {
+                     "device_id": "Device ID"
+                 }
++            },
++            "local_pick": {
++                "title": "Devices on this broker",
++                "description": "Pick a litter box reported by your local broker.",
++                "data": {
++                    "device_id": "Device",
++                    "friendly_name": "Name (optional)"
++                }
+             }
+         },
++        "error": {
++            "cannot_connect": "Cannot reach the local broker.",
++            "no_devices_found": "The broker reports no devices yet."
++        },
+         "abort": {
+             "connection": "Error during connection.",
+             "authentication": "Error during authentication.",
+-            "unknown": "Unknown error."
++            "unknown": "Unknown error.",
++            "no_devices_found": "The broker reports no devices yet.",
++            "already_configured": "This device is already configured."
+         }
+     },
+     "entity": {
+@@ -51,6 +82,12 @@
+             "last_usage": {
+                 "name": "Last usage"
+             },
++            "activity": {
++                "name": "Activity"
++            },
++            "record_count": {
++                "name": "Stored records"
++            },
+             "status": {
+                 "name": "Status",
+                 "state": {
+@@ -95,5 +132,21 @@
+                 "name": "Small cat mode (<1.5kg)"
+             }
+         }
++    },
++    "options": {
++        "step": {
++            "init": {
++                "title": "Pet Marvel options",
++                "description": "Switch between the vendor cloud and your local broker at any time.",
++                "data": {
++                    "use_local_broker": "Use self-hosted broker (local)",
++                    "mqtt_host": "Broker host",
++                    "mqtt_port": "Broker port"
++                }
++            }
++        },
++        "error": {
++            "cannot_connect": "Cannot reach the local broker."
++        }
+     }
+-}
++}
+\ No newline at end of file

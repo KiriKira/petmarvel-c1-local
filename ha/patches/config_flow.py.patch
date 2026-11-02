@@ -1,0 +1,341 @@
+--- a/custom_components/pet_marvel/config_flow.py
++++ b/custom_components/pet_marvel/config_flow.py
+@@ -1,42 +1,213 @@
++"""Config flow / options flow for Pet Marvel.
++
++两种数据链路：
++- cloud：原版阿里云 OpenAPI 轮询（默认，保持原行为）
++- mqtt ：自建 broker（路由器上的 petbroker），本地推送
++
++集成选项里的 `use_local_broker` 是运行期开关，切换后 reload 即生效。
++"""
++
+ import logging
+ from typing import Any
+ 
+ import voluptuous as vol
+-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
++from homeassistant.config_entries import (
++    ConfigEntry,
++    ConfigFlow,
++    ConfigFlowResult,
++    OptionsFlow,
++)
+ from homeassistant.const import (
++    CONF_COUNTRY,
+     CONF_DEVICE_ID,
++    CONF_EMAIL,
+     CONF_FRIENDLY_NAME,
+     CONF_PASSWORD,
+-    CONF_EMAIL,
+-    CONF_COUNTRY,
+ )
+ from homeassistant.helpers.aiohttp_client import async_get_clientsession
+ from homeassistant.helpers.selector import (
+     SelectSelector,
+-    SelectSelectorMode,
+     SelectSelectorConfig,
++    SelectSelectorMode,
+ )
+ 
+-from .api import PetMarvelAPI, APIAuthError, APIConnectionError
++from .api import APIAuthError, APIConnectionError, PetMarvelAPI
+ from .const import DOMAIN, VALID_COUNTRY_TO_CODE_MAPPING
++from .mqtt_client import discover_devices
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
++DEFAULT_HOST = "192.168.31.1"
++DEFAULT_PORT = 1884
++CONF_USE_LOCAL = "use_local_broker"
++CONF_MQTT_HOST = "mqtt_host"
++CONF_MQTT_PORT = "mqtt_port"
++TRANSPORT_CLOUD = "cloud"
++TRANSPORT_MQTT = "mqtt"
++
++
++async def async_probe_broker(hass, host: str, port: int) -> bool:
++    """确认 broker 的 HA 端口可连（发一个最小 MQTT CONNECT，期待 CONNACK）。"""
++
++    def _probe() -> bool:
++        import socket
++
++        try:
++            sock = socket.create_connection((host, int(port)), timeout=3)
++            client_id = b"ha-probe"
++            payload = (
++                b"\x00\x04MQTT\x04\x02\x00\x3c"
++                + len(client_id).to_bytes(2, "big")
++                + client_id
++            )
++            sock.sendall(bytes([0x10, len(payload)]) + payload)
++            resp = sock.recv(4)
++            sock.close()
++            return resp[:4] == b"\x20\x02\x00\x00"
++        except Exception as err:  # pragma: no cover - 探测失败即返回 False
++            _LOGGER.debug("petmarvel broker probe failed: %s", err)
++            return False
++
++    return await hass.async_add_executor_job(_probe)
++
+ 
+ class PetMarvelConfigFlow(ConfigFlow, domain=DOMAIN):
+     VERSION = 1
+ 
+     def __init__(self) -> None:
+-        """Initialize the config flow."""
+-        self._country: None = None
+-        self._email: None = None
+-        self._password: None = None
++        self._country: str | None = None
++        self._email: str | None = None
++        self._password: str | None = None
+         self._discovered_devices: dict[str, str] = {}
++        self._use_local = False
++        self._broker_devices: list = []
++        self._host = DEFAULT_HOST
++        self._port = DEFAULT_PORT
++
++    @staticmethod
++    def async_get_options_flow(config_entry: ConfigEntry | None = None) -> "PetMarvelOptionsFlow":
++        return PetMarvelOptionsFlow()
+ 
++    # ---------- 第一步：选链路 ----------
+     async def async_step_user(
+         self, user_input: dict[str, Any] | None = None
+     ) -> ConfigFlowResult:
+         if user_input is not None:
++            self._use_local = bool(user_input.get(CONF_USE_LOCAL))
++            if self._use_local:
++                return await self.async_step_local()
++            return await self.async_step_cloud()
++
++        return self.async_show_form(
++            step_id="user",
++            data_schema=vol.Schema(
++                {vol.Required(CONF_USE_LOCAL, default=False): bool}
++            ),
++        )
++
++    # ---------- 本地 broker ----------
++    async def async_step_local(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        errors: dict[str, str] = {}
++        if user_input is not None:
++            device_id = str(user_input.get(CONF_DEVICE_ID) or "").strip()
++            host = str(user_input[CONF_MQTT_HOST]).strip() or DEFAULT_HOST
++            port = int(user_input[CONF_MQTT_PORT])
++            if not await async_probe_broker(self.hass, host, port):
++                errors["base"] = "cannot_connect"
++            else:
++                self._host, self._port = host, port
++                if device_id:
++                    return await self._async_create_local(device_id, host, port)
++                # 没填就让 broker 报出它管的所有设备
++                listed = await self.hass.async_add_executor_job(
++                    discover_devices, host, port
++                )
++                self._broker_devices = listed
++                if listed:
++                    return await self.async_step_local_pick()
++                errors["base"] = "no_devices_found"
++
++        return self.async_show_form(
++            step_id="local",
++            data_schema=vol.Schema(
++                {
++                    vol.Required(CONF_MQTT_HOST, default=DEFAULT_HOST): str,
++                    vol.Required(CONF_MQTT_PORT, default=DEFAULT_PORT): int,
++                    vol.Optional(CONF_DEVICE_ID, default=""): str,
++                    vol.Optional(CONF_FRIENDLY_NAME, default=""): str,
++                }
++            ),
++            errors=errors,
++        )
++
++    async def async_step_local_pick(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        """broker 上的设备列表，选一台接入。"""
++        choices: dict[str, str] = {}
++        for item in self._broker_devices:
++            dev = str(item.get("device_id") or "").strip()
++            if not dev:
++                continue
++            ip = item.get("ip") or "?"
++            state = "在线" if item.get("online") else "离线"
++            fw = item.get("fw_version") or "-"
++            choices[dev] = f"{dev} · {ip} · {state} · fw {fw}"
++        if not choices:
++            return self.async_abort(reason="no_devices_found")
++
++        if user_input is not None:
++            device_id = user_input[CONF_DEVICE_ID]
++            return await self._async_create_local(device_id, self._host, self._port)
++
++        return self.async_show_form(
++            step_id="local_pick",
++            data_schema=vol.Schema(
++                {
++                    vol.Required(CONF_DEVICE_ID): vol.In(choices),
++                    vol.Optional(CONF_FRIENDLY_NAME, default=""): str,
++                }
++            ),
++        )
++
++    async def _async_create_local(
++        self, device_id: str, host: str, port: int
++    ) -> ConfigFlowResult:
++        title = None
++        for item in getattr(self, "_broker_devices", []) or []:
++            if str(item.get("device_id")) == device_id:
++                title = f"Pet Marvel {device_id}"
++                break
++        await self.async_set_unique_id(device_id, raise_on_progress=False)
++        self._abort_if_unique_id_configured()
++        return self.async_create_entry(
++            title=title or f"Pet Marvel {device_id}",
++            data={
++                "transport": TRANSPORT_MQTT,
++                CONF_DEVICE_ID: device_id,
++                CONF_FRIENDLY_NAME: device_id,
++                CONF_MQTT_HOST: host,
++                CONF_MQTT_PORT: port,
++                # 旧字段占位，避免 coordinator 读取时 KeyError
++                CONF_COUNTRY: "China",
++                CONF_EMAIL: "",
++                CONF_PASSWORD: "",
++            },
++            options={
++                CONF_USE_LOCAL: True,
++                CONF_MQTT_HOST: host,
++                CONF_MQTT_PORT: port,
++                "device_key": device_id,
++            },
++        )
++
++    # ---------- 云端（原版流程） ----------
++    async def async_step_cloud(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        if user_input is not None:
+             self._country = user_input[CONF_COUNTRY]
+             self._email = user_input[CONF_EMAIL]
+             self._password = user_input[CONF_PASSWORD]
+@@ -47,13 +218,10 @@
+ 
+                 devices = await api.get_devices()
+                 discovered_devices = {}
+-
+                 for device in list(
+                     filter(lambda dev: dev["categoryKey"] == "CatLitter", devices)
+                 ):
+-                    device_name = device["deviceName"]
+-                    device_id = device["iotId"]
+-                    discovered_devices[device_id] = device_name
++                    discovered_devices[device["iotId"]] = device["deviceName"]
+                 self._discovered_devices = discovered_devices
+                 return await self.async_step_device(None)
+             except APIAuthError as e:
+@@ -64,7 +232,7 @@
+                 return self.async_abort(reason="connection")
+ 
+         return self.async_show_form(
+-            step_id="user",
++            step_id="cloud",
+             data_schema=vol.Schema(
+                 {
+                     vol.Required(CONF_COUNTRY): SelectSelector(
+@@ -84,14 +252,18 @@
+             device_id = user_input[CONF_DEVICE_ID]
+             await self.async_set_unique_id(device_id, raise_on_progress=False)
+             self._abort_if_unique_id_configured()
+-            data = {}
+-            data[CONF_DEVICE_ID] = device_id
+-            data[CONF_FRIENDLY_NAME] = self._discovered_devices[device_id]
+-            data[CONF_COUNTRY] = self._country
+-            data[CONF_EMAIL] = self._email
+-            data[CONF_PASSWORD] = self._password
++            data = {
++                CONF_DEVICE_ID: device_id,
++                CONF_FRIENDLY_NAME: self._discovered_devices[device_id],
++                CONF_COUNTRY: self._country,
++                CONF_EMAIL: self._email,
++                CONF_PASSWORD: self._password,
++                "transport": TRANSPORT_CLOUD,
++            }
+             return self.async_create_entry(
+-                title=self._discovered_devices[device_id], data=data
++                title=self._discovered_devices[device_id],
++                data=data,
++                options={CONF_USE_LOCAL: False},
+             )
+ 
+         if not self._discovered_devices:
+@@ -103,3 +275,65 @@
+                 {vol.Required(CONF_DEVICE_ID): vol.In(self._discovered_devices)}
+             ),
+         )
++
++
++class PetMarvelOptionsFlow(OptionsFlow):
++    """运行期开关：切到自建 broker 或回到云端。"""
++
++    async def async_step_init(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        entry = self.config_entry
++        errors: dict[str, str] = {}
++
++        current_use_local = bool(
++            entry.options.get(
++                CONF_USE_LOCAL, entry.data.get("transport") == TRANSPORT_MQTT
++            )
++        )
++        current_host = (
++            entry.options.get(CONF_MQTT_HOST)
++            or entry.data.get(CONF_MQTT_HOST)
++            or DEFAULT_HOST
++        )
++        current_port = int(
++            entry.options.get(CONF_MQTT_PORT)
++            or entry.data.get(CONF_MQTT_PORT)
++            or DEFAULT_PORT
++        )
++
++        if user_input is not None:
++            use_local = bool(user_input[CONF_USE_LOCAL])
++            host = str(user_input.get(CONF_MQTT_HOST) or current_host).strip() or DEFAULT_HOST
++            port = int(user_input.get(CONF_MQTT_PORT) or current_port)
++            if use_local and not await async_probe_broker(self.hass, host, port):
++                errors["base"] = "cannot_connect"
++            else:
++                # 合并而不是覆盖，保住 device_key 等其它选项
++                new_options = dict(entry.options)
++                new_options.update(
++                    {
++                        CONF_USE_LOCAL: use_local,
++                        CONF_MQTT_HOST: host,
++                        CONF_MQTT_PORT: port,
++                    }
++                )
++                new_options.setdefault(
++                    "device_key",
++                    entry.data.get(CONF_FRIENDLY_NAME)
++                    or entry.data.get(CONF_DEVICE_ID)
++                    or "",
++                )
++                return self.async_create_entry(title="", data=new_options)
++
++        return self.async_show_form(
++            step_id="init",
++            data_schema=vol.Schema(
++                {
++                    vol.Required(CONF_USE_LOCAL, default=current_use_local): bool,
++                    vol.Optional(CONF_MQTT_HOST, default=current_host): str,
++                    vol.Optional(CONF_MQTT_PORT, default=current_port): int,
++                }
++            ),
++            errors=errors,
++        )

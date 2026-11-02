@@ -1,0 +1,152 @@
+{
+    "title": "Pet Marvel",
+    "config": {
+        "step": {
+            "user": {
+                "title": "Pet Marvel",
+                "description": "选择 Home Assistant 与猫砂盆的通信方式。",
+                "data": {
+                    "use_local_broker": "使用自建 broker（本地链路）"
+                }
+            },
+            "cloud": {
+                "title": "Pet Marvel 云端登录",
+                "description": "输入 Pet Marvel 账号凭据。",
+                "data": {
+                    "country": "国家",
+                    "email": "邮箱 / 手机号",
+                    "password": "密码"
+                }
+            },
+            "local": {
+                "title": "本地 broker",
+                "description": "填写路由器上的 broker 地址。设备 ID 留空会自动列出 broker 上的设备。",
+                "data": {
+                    "mqtt_host": "broker 地址",
+                    "mqtt_port": "broker 端口",
+                    "device_id": "设备 ID（可留空）",
+                    "friendly_name": "名称（可留空）"
+                }
+            },
+            "device": {
+                "description": "选择要接入的设备。",
+                "data": {
+                    "device_id": "设备 ID"
+                }
+            },
+            "local_pick": {
+                "title": "broker 上的设备",
+                "description": "选择本地 broker 上报的猫砂盆。",
+                "data": {
+                    "device_id": "设备",
+                    "friendly_name": "名称（可留空）"
+                }
+            }
+        },
+        "error": {
+            "cannot_connect": "连不上本地 broker。",
+            "no_devices_found": "broker 上还没有设备。"
+        },
+        "abort": {
+            "connection": "连接出错。",
+            "authentication": "认证失败。",
+            "unknown": "未知错误。",
+            "no_devices_found": "broker 上还没有设备。",
+            "already_configured": "该设备已配置。"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Pet Marvel 选项",
+                "description": "随时在厂商云端和本地 broker 之间切换。",
+                "data": {
+                    "use_local_broker": "使用自建 broker（本地链路）",
+                    "mqtt_host": "broker 地址",
+                    "mqtt_port": "broker 端口"
+                }
+            }
+        },
+        "error": {
+            "cannot_connect": "连不上本地 broker。"
+        }
+    },
+    "entity": {
+        "button": {
+            "clean": {
+                "name": "立即清理"
+            },
+            "level": {
+                "name": "平整猫砂"
+            },
+            "dump": {
+                "name": "倒空换袋"
+            }
+        },
+        "binary_sensor": {
+            "lid_installed": {
+                "name": "上盖在位"
+            },
+            "bin_inserted": {
+                "name": "集便盒在位"
+            },
+            "bin_full": {
+                "name": "集便盒已满"
+            }
+        },
+        "sensor": {
+            "last_usage": {
+                "name": "上次使用"
+            },
+            "activity": {
+                "name": "最近活动"
+            },
+            "record_count": {
+                "name": "已存记录"
+            },
+            "status": {
+                "name": "状态",
+                "state": {
+                    "idle": "空闲",
+                    "cleaning": "清理中",
+                    "cleaning_complete": "清理完成",
+                    "dumping": "倒砂中",
+                    "dumping_complete": "倒砂完成",
+                    "resetting": "复位中",
+                    "resetting_complete": "复位完成",
+                    "paused": "已暂停",
+                    "cat_approaching": "猫靠近",
+                    "cat_entering": "猫进入"
+                }
+            },
+            "error_status": {
+                "name": "故障状态",
+                "state": {
+                    "normal": "正常",
+                    "motor_failure": "电机故障",
+                    "magnet_clean_abnormal": "清理磁感应异常",
+                    "magnet_idle_abnormal": "待机磁感应异常",
+                    "weight_abnormal": "称重异常",
+                    "weight_high": "称重超载"
+                }
+            },
+            "software_version": {
+                "name": "固件版本"
+            }
+        },
+        "switch": {
+            "auto_clean": {
+                "name": "自动清理"
+            },
+            "auto_bury": {
+                "name": "自动掩埋"
+            },
+            "device_lights": {
+                "name": "指示灯"
+            },
+            "small_cat_mode": {
+                "name": "幼猫模式（<1.5kg）"
+            }
+        }
+    }
+}
