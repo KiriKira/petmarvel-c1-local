@@ -39,28 +39,50 @@ address=/public.iot-as-mqtt.cn-shanghai.aliyuncs.com/192.168.31.1
 ### 2. DNAT（主力）
 
 ```
-iptables -t nat -A PREROUTING -s <设备 IP> -p tcp --dport 1883 -j DNAT --to-destination 127.0.0.1:1883
-iptables -t nat -A PREROUTING -s <设备 IP> -p tcp --dport 443  -j DNAT --to-destination 127.0.0.1:8443
-echo 1 > /proc/sys/net/ipv4/conf/br-lan/route_localnet
+iptables -t nat -A PREROUTING -s <设备 IP> -p tcp --dport 1883 -j DNAT --to-destination 192.168.31.1:1883
+iptables -t nat -A PREROUTING -s <设备 IP> -p tcp --dport 443  -j DNAT --to-destination 192.168.31.1:8443
 ```
 
 只匹配**源**和**目的端口**，不看目的 IP，所以阿里云换节点也不影响。
 设备 IP 从 DHCP 租约自动发现（hostname 里带 `tg7100c`），换了 IP 也能跟上。
 
-`route_localnet` 必须有，否则 DNAT 到 `127.0.0.1` 会被内核当 martian 丢弃。
+**DNAT 目标必须是路由器自己的 LAN 地址，不要用 `127.0.0.1`。**
+转到 `127.0.0.1` 要求 `net.ipv4.conf.br-lan.route_localnet=1`，而这是内核参数，
+**重启或接口重载后会归零**；一旦归零，DNAT 就变成黑洞——规则看着还在，包全被当非法地址丢掉，
+设备表现为连不上服务器（白灯闪）。用 LAN 地址走本地路由，没有这个依赖。
+
+另外 `route_localnet` 归零时**规则依然存在**，所以"规则在 = 正常"这个判断会骗人，
+排查时要看 `conntrack -L | grep <设备IP>` 有没有 ESTABLISHED。
+
+### 2.5 规则要能跟着 DHCP 走
+
+开机时 `/tmp/dhcp.leases` 往往还是空的（tmpfs，重启即空），脚本拿不到设备 IP 就会绑到兜底值，
+之后设备就算在线也匹配不上。所以除了开机执行，还要挂一条 cron 定期重跑（脚本是幂等的）：
+
+```
+*/5 * * * * /data/petbroker_init.sh >/dev/null 2>&1
+```
 
 ### 3. 假 HTTPS（封死最后的出网需求）
 
-设备开机时会访问 `*.link.aliyuncs.com:443`（阿里云 Link 平台，做激活/OTA 检查/日志上报）。
-
-**不能只 REJECT**：实测设备会卡在开机状态反复重试，永远不打开 MQTT。
-所以 broker 内置一个 HTTPS 服务端，用同一张自签证书应答：
+设备开机时会访问 `*.link.aliyuncs.com:443`（阿里云 Link 平台），其中最关键的是：
 
 ```
-请求 → 记录 method/URI/Host/UA/body → 回 200 {"code":200,"success":true,...}
+POST /auth/bootstrap
+productKey=...&deviceName=...&clientId=...&timestamp=...&resources=mqtt
 ```
 
-设备拿到成功响应就不再重试，也不需要真的出网。
+**设备是先用这个接口换到 `iotToken`，才去连 MQTT 1883 的。**
+只回一个空的 200 JSON，设备拿不到 token 就永远不连 MQTT，表现就是白灯闪 + 每分钟重试一次。
+broker 自己并不校验 token，所以回一个带 `iotToken` 的固定结构即可：
+
+```json
+{"code":200,"message":"success","data":{
+  "iotId":"<deviceName>","iotToken":"<任意值>",
+  "resources":{"mqtt":{"host":"public.iot-as-mqtt.cn-shanghai.aliyuncs.com","port":1883,"version":"1.0"}}}}
+```
+
+其余路径统一回 200 空 JSON，并把 method/URI/Host/UA/body 记进日志，方便以后按需定制。
 
 ## 为什么不用改 App
 

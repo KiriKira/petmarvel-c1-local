@@ -24,6 +24,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -866,7 +867,40 @@ func startFakeHTTPS(addr string, cert tls.Certificate) {
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 16384))
 		log.Printf("[fake-https] %s %s host=%s ua=%q body=%s",
 			r.Method, r.URL.RequestURI(), r.Host, r.UserAgent(), string(body))
+
 		w.Header().Set("Content-Type", "application/json")
+
+		// /auth/bootstrap：设备启动时靠它换 MQTT 接入凭证（iotToken）。
+		// 只回 200 空 JSON 的话设备永远不连 MQTT，表现就是白灯闪 + 每分钟重试。
+		// broker 自己不校验 token，所以发一个固定值即可。
+		if strings.Contains(r.URL.Path, "/auth/bootstrap") {
+			vals, _ := url.ParseQuery(string(body))
+			pk := vals.Get("productKey")
+			dn := vals.Get("deviceName")
+			resp := map[string]any{
+				"code":    200,
+				"message": "success",
+				"data": map[string]any{
+					"iotId":    dn,
+					"iotToken": "00000000000000000000000000000000",
+					"resources": map[string]any{
+						"mqtt": map[string]any{
+							"host":    "public.iot-as-mqtt.cn-shanghai.aliyuncs.com",
+							"port":    1883,
+							"version": "1.0",
+						},
+					},
+				},
+			}
+			if pk != "" || dn != "" {
+				log.Printf("[fake-https] bootstrap %s.%s -> issuing local token", pk, dn)
+			}
+			js, _ := json.Marshal(resp)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(js)
+			return
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"code":200,"message":"success","success":true,"data":{}}`))
 	})

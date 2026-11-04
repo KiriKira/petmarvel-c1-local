@@ -112,6 +112,8 @@ TLV：`id(1B) len(1B) value(len B)`。
 ## 设备行为要点
 
 - 断电或重连后会先发 `/ext/ntp/.../request`，再发完整 up_raw 快照。
-- 开机流程里会向 `*.link.aliyuncs.com:443` 发起 HTTPS 请求（激活 / OTA 检查 / 日志上报）。
-  拦掉它设备会卡在开机状态反复重试，见 `docs/architecture.md` 里的假 HTTPS 说明。
+- 开机流程里会向 `*.link.aliyuncs.com:443` 发 HTTPS 请求，其中 `POST /auth/bootstrap`
+  （`productKey=..&deviceName=..&clientId=..&resources=mqtt`）用来换取 MQTT 的 `iotToken`。
+  **设备是拿到 token 才去连 1883 的**：这个接口不返回带 `iotToken` 的结构，设备就一直白灯闪、
+  每分钟重试一次，永远不连 broker。只 REJECT 443 同理。详见 `docs/architecture.md`。
 - 状态上报是"变化触发 + 定期全量"，所以 HA 侧要接受**字段缺失**并保留上一次的值。

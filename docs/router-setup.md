@@ -76,6 +76,17 @@ ssh root@192.168.31.1 '
 脚本做的事：等 `/data` 挂载 → 解压二进制 → pidfile 判活后启动 → 重建 DNS 劫持 /
 DNAT / FORWARD 规则（幂等，可反复执行）。
 
+**再加一条 cron 定期重跑**。开机那一刻 `/tmp/dhcp.leases`（tmpfs）往往是空的，
+脚本拿不到设备 IP 就会绑到兜底地址，之后设备在线也匹配不上：
+
+```sh
+ssh root@192.168.31.1 '
+  echo "*/5 * * * * /data/petbroker_init.sh >/dev/null 2>&1" >> /etc/crontabs/root
+  cp /etc/crontabs/root /data/etc/crontabs/root
+  killall crond; sleep 1; crond -c /etc/crontabs
+'
+```
+
 ## 6. 验证接管
 
 ```sh
@@ -99,10 +110,17 @@ ssh root@192.168.31.1 '
 
 ## 常见问题
 
-**设备白灯闪** = WiFi 没连上。检查 DNAT 还在不在、broker 是否在监听（规则在但没人接，设备会白闪）。
+**设备白灯闪（重启路由器后最常见）**：白灯闪 = 连不上服务器。按顺序查三件事：
 
-**设备一直不连** = 先看 `iptables -L FORWARD -n -v` 有没有被 REJECT 的计数。
-如果 443 被拒，设备会卡在开机阶段（见 `docs/architecture.md`）。
+1. `cat /proc/sys/net/ipv4/conf/br-lan/route_localnet` 是否为 1 —— 如果 DNAT 目标写的是
+   `127.0.0.1`，这个为 0 时包会被当非法地址丢弃。**规则还在但完全不通**，这就是最坑的地方。
+   建议直接把 DNAT 目标改成路由器 LAN 地址避开它。
+2. `iptables -t nat -S PREROUTING | grep 1883` 里的源 IP 是不是设备**当前**的 IP
+   （开机时 DHCP 租约可能为空，见上面的 cron）。
+3. `tail /tmp/petbroker.log` 有没有 `[fake-https] POST /auth/bootstrap` 在每分钟重复。
+   重复出现 = 假 HTTPS 没给设备发 `iotToken`，设备拿不到凭证就不去连 MQTT。
+
+**设备一直不连 MQTT 但 443 有请求**：看第三条。`/auth/bootstrap` 必须回带 `iotToken` 的 JSON。
 
 **`scp` 报错** = dropbear 没 sftp-server，用上面 `cat | ssh 'cat >'`。
 
@@ -111,4 +129,11 @@ ssh root@192.168.31.1 '
 
 **重启后规则没了** = UCI include 没提交（`uci commit firewall`），或者脚本没执行权限。
 
+**HA 实体一直 unavailable 但 broker 日志里设备正常** = 集成在重试上限后放弃了，
+重载集成或重启 HA 即可；期间 MQTT 连接可能还在，所以看起来"连上了但没数据"。
+
 **`/data` 空间不够** = `xz -9` 压缩后约 1.3 MB；可以把二进制换成 `-ldflags "-s -w"` 再压。
+
+**担心 broker 吃内存**：正常 RSS 5 MB 左右、5 个 goroutine 级线程。用
+`grep VmRSS /proc/$(cat /var/run/petbroker.pid)/status` 确认。
+路由器的内存压力通常来自别的组件（Clash 内核、Docker、厂商自带服务），不是它。
